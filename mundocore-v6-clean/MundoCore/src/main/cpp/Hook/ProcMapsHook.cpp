@@ -27,8 +27,10 @@
 
 static char g_host_data_dir[512] = {};
 // Host package name extracted from g_host_data_dir, e.g. "com.google.ark".
-// Any maps line containing this string is removed so TSS never sees host paths.
+// Any maps line containing this string has the pkg name REPLACED (not dropped)
+// so TSS never sees host paths while the game still has valid lib mappings.
 static char g_host_pkg[256] = {};
+#define MAPS_NEUTRAL_PKG "com.android.virt"
 
 // Per-thread re-entrance guard. Prevents the hook from triggering itself when
 // build_filtered_content() calls orig_open/orig_fopen internally.
@@ -72,23 +74,6 @@ static bool extract_pkg(const char *start, char *out, size_t out_size) {
 }
 
 static void clean_maps_line(const char *line, char *out, size_t out_size) {
-    // Drop any maps line that exposes the host package name.
-    // This covers lines like:
-    //   /data/app/~~hash==/com.google.ark-hash==/lib/arm64/libMundoCore.so
-    //   /data/user/0/com.google.ark/cache/...
-    // TSS uses these to detect virtual container environments.
-    if (g_host_pkg[0] && strstr(line, g_host_pkg)) {
-        const char *orig_p = strrchr(line, ' ');
-        if (orig_p) {
-            char op[256];
-            snprintf(op, sizeof(op), "%s", orig_p + 1);
-            char *nl = strchr(op, '\n'); if (nl) *nl = '\0';
-            TRACE("[maps-drop] hiding host path: %s", op);
-        }
-        out[0] = '\0';   // empty → caller skips this line
-        return;
-    }
-
     char *cur = strdup(line);
     if (!cur) {
         strncpy(out, line, out_size - 1);
@@ -194,6 +179,28 @@ static void clean_maps_line(const char *line, char *out, size_t out_size) {
     if (strstr(cur, "SdCard/Android/")) {
         char *tmp = str_replace_first(cur, "SdCard/Android/", "Android/");
         if (tmp) { free(cur); cur = tmp; }
+    }
+
+    // Final pass: if g_host_pkg is STILL visible anywhere in the line (e.g. the
+    // host-app APK/lib path /data/app/~~hash==/com.google.ark-hash==/...)
+    // replace it with a neutral placeholder. The line is kept — the game's
+    // existing memory mappings are unaffected by what the path string says —
+    // but TSS can no longer detect the host package name.
+    if (g_host_pkg[0] && strstr(cur, g_host_pkg)) {
+        char op[256] = {}, np[256] = {};
+        const char *op_p = strrchr(cur, ' ');
+        if (op_p) {
+            snprintf(op, sizeof(op), "%s", op_p + 1);
+            char *nl = strchr(op, '\n'); if (nl) *nl = '\0';
+        }
+        char *tmp = str_replace_first(cur, g_host_pkg, MAPS_NEUTRAL_PKG);
+        if (tmp) { free(cur); cur = tmp; }
+        const char *np_p = strrchr(cur, ' ');
+        if (np_p) {
+            snprintf(np, sizeof(np), "%s", np_p + 1);
+            char *nl = strchr(np, '\n'); if (nl) *nl = '\0';
+        }
+        TRACE("[maps-replace] %s  =>  %s", op, np);
     }
 
     // Log if this line was modified (bbox path was cleaned)
