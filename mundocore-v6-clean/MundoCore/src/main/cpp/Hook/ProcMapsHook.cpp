@@ -1,11 +1,10 @@
 //
 // ProcMapsHook.cpp
-// Hooks fopen/fopen64 to filter /proc/self/maps content.
-// Replaces bbox sandbox paths with clean virtual paths so guest apps
-// (games, anti-cheat SDKs) cannot detect they are running inside the
-// virtual container.
+// Hooks fopen/fopen64 AND open/openat to filter /proc/self/maps content.
+// Covers both stdio-layer readers (most JVM/Unity code) and direct fd-layer
+// readers (TSS, GameGuard, and other native anti-cheat SDKs).
 //
-// Replacements performed on each line:
+// Replacements performed on each maps line:
 //   <host_data_dir>/data/user/<uid>/<pkg>/  ->  /data/data/<pkg>/
 //   <host_data_dir>/data/user_de/<uid>/<pkg>/  ->  /data/user_de/<uid>/<pkg>/
 //   <host_data_dir>/data/app/<pkg>/  ->  /data/app/<pkg>/
@@ -20,15 +19,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <sys/syscall.h>
 
-static char g_host_data_dir[512] = {};   // e.g. /data/data/com.mundo.bbox/files
+static char g_host_data_dir[512] = {};
+
+// Per-thread re-entrance guard. Prevents the hook from triggering itself when
+// build_filtered_content() calls orig_open/orig_fopen internally.
+static thread_local bool g_in_maps_build = false;
 
 // ---------------------------------------------------------------------------
 // String utilities
 // ---------------------------------------------------------------------------
 
-// Replace first occurrence of `from` in `src` with `to`.
-// Returns a malloc'd string on match, nullptr on no match.
 static char *str_replace_first(const char *src, const char *from, const char *to) {
     const char *pos = strstr(src, from);
     if (!pos) return nullptr;
@@ -51,25 +56,18 @@ static char *str_replace_first(const char *src, const char *from, const char *to
 // Per-line path cleaning
 // ---------------------------------------------------------------------------
 
-// Extract the package name from a path component that starts at `start`.
-// The package name ends at the next '/'.  Writes into `out` (max out_size).
-// Returns false if not found or too long.
 static bool extract_pkg(const char *start, char *out, size_t out_size) {
     const char *end = strchr(start, '/');
-    if (!end) end = start + strlen(start);  // end of string
+    if (!end) end = start + strlen(start);
     size_t len = (size_t)(end - start);
     if (len == 0 || len >= out_size) return false;
     memcpy(out, start, len);
     out[len] = '\0';
-    // Sanity: package names contain '.', not spaces
     if (!strchr(out, '.')) return false;
     return true;
 }
 
-// Apply all bbox-path replacements to `line` (NUL-terminated).
-// Result is written into `out` (size out_size).
 static void clean_maps_line(const char *line, char *out, size_t out_size) {
-    // Work in a local heap buffer so we can chain replacements.
     char *cur = strdup(line);
     if (!cur) {
         strncpy(out, line, out_size - 1);
@@ -85,17 +83,15 @@ static void clean_maps_line(const char *line, char *out, size_t out_size) {
             const char *pos = strstr(cur, pfx);
             if (pos) {
                 const char *after_pfx = pos + strlen(pfx);
-                // skip uid digits
-                const char *uid_end = strchr(after_pfx, '/');
+                const char *uid_end   = strchr(after_pfx, '/');
                 if (uid_end) {
                     const char *pkg_start = uid_end + 1;
                     char guest_pkg[256];
                     if (extract_pkg(pkg_start, guest_pkg, sizeof(guest_pkg))) {
-                        // Build full target and replacement
                         char target[700], repl[300];
-                        // pkg_start - after_pfx includes the trailing '/' of the uid
-                        // segment (e.g. "0/"). Subtract 1 so %.*s prints just "0",
-                        // then the format's own '/' produces the single separator.
+                        // (pkg_start - after_pfx) includes trailing '/' of the uid
+                        // segment; subtract 1 so %.*s prints just the digits ("0"),
+                        // then the format string's own '/' gives a single separator.
                         snprintf(target, sizeof(target), "%s/data/user/%.*s/%s/",
                                  g_host_data_dir,
                                  (int)(pkg_start - after_pfx - 1),
@@ -116,7 +112,7 @@ static void clean_maps_line(const char *line, char *out, size_t out_size) {
             const char *pos = strstr(cur, pfx);
             if (pos) {
                 const char *after_pfx = pos + strlen(pfx);
-                const char *uid_end = strchr(after_pfx, '/');
+                const char *uid_end   = strchr(after_pfx, '/');
                 if (uid_end) {
                     const char *pkg_start = uid_end + 1;
                     char uid_buf[32];
@@ -172,42 +168,133 @@ static void clean_maps_line(const char *line, char *out, size_t out_size) {
 }
 
 // ---------------------------------------------------------------------------
-// Filtered maps FILE* builder
+// Hook pointers — declared before build_filtered_content() references them
 // ---------------------------------------------------------------------------
 
-static FILE *build_filtered_maps() {
-    // MUST use orig_fopen, not fopen — fopen is already hooked at this point
-    // and calling it here would cause infinite recursion → stack overflow.
-    if (!orig_fopen) return nullptr;
-    FILE *real = orig_fopen("/proc/self/maps", "r");
+static FILE *(*orig_fopen)(const char *, const char *)   = nullptr;
+static FILE *(*orig_fopen64)(const char *, const char *) = nullptr;
+
+typedef int (*open_fn_t)(const char *, int, ...);
+typedef int (*openat_fn_t)(int, const char *, int, ...);
+static open_fn_t   orig_open   = nullptr;
+static openat_fn_t orig_openat = nullptr;
+
+// ---------------------------------------------------------------------------
+// Core: read and filter /proc/self/maps into a malloc'd buffer.
+// MUST only be called with g_in_maps_build == true (caller sets the flag).
+// Returns malloc'd buffer (caller must free) and sets *out_sz, or nullptr.
+// ---------------------------------------------------------------------------
+
+static char *build_filtered_content(size_t *out_sz) {
+    FILE *real = nullptr;
+
+    // Prefer orig_open — bypasses stdio wrapper entirely.
+    if (orig_open) {
+        int fd = orig_open("/proc/self/maps", O_RDONLY);
+        if (fd >= 0) {
+            real = fdopen(fd, "r");
+            if (!real) close(fd);
+        }
+    }
+    // When open() == openat() on this platform, orig_open stays nullptr;
+    // fall back to openat(AT_FDCWD, ...).
+    if (!real && orig_openat) {
+        int fd = orig_openat(AT_FDCWD, "/proc/self/maps", O_RDONLY);
+        if (fd >= 0) {
+            real = fdopen(fd, "r");
+            if (!real) close(fd);
+        }
+    }
+    // Final fallback: orig_fopen (always set before any hook can fire).
+    if (!real && orig_fopen) {
+        real = orig_fopen("/proc/self/maps", "r");
+    }
     if (!real) return nullptr;
 
     char *content = nullptr;
-    size_t content_sz = 0;
-    FILE *ms = open_memstream(&content, &content_sz);
+    size_t csz = 0;
+    FILE *ms = open_memstream(&content, &csz);
     if (!ms) { fclose(real); return nullptr; }
 
-    char line[2048];
-    char filtered[2048];
+    char line[2048], filtered[2048];
     while (fgets(line, sizeof(line), real)) {
         clean_maps_line(line, filtered, sizeof(filtered));
         fputs(filtered, ms);
     }
     fclose(real);
-    fclose(ms);  // flushes; content/content_sz are now valid
+    fclose(ms);
 
-    if (!content || content_sz == 0) {
-        free(content);
-        return nullptr;
-    }
+    if (!content || csz == 0) { free(content); return nullptr; }
+    *out_sz = csz;
+    return content;
+}
 
-    // fmemopen uses the buffer in-place ("r" mode, no copy on Android bionic).
-    // content is intentionally not freed here — it backs the returned FILE*.
-    // The leak is bounded: one maps snapshot (~50-200 KB), created at most a
-    // handful of times during app startup.
-    FILE *result = fmemopen(content, content_sz, "r");
+// ---------------------------------------------------------------------------
+// FILE* version — returned by hooked fopen / fopen64
+// ---------------------------------------------------------------------------
+
+static FILE *build_filtered_maps() {
+    if (g_in_maps_build) return nullptr;
+    g_in_maps_build = true;
+    size_t csz = 0;
+    char *content = build_filtered_content(&csz);
+    g_in_maps_build = false;
+    if (!content) return nullptr;
+    // content backs the returned FILE*; freed when FILE is closed only if
+    // fmemopen uses the buffer (Android bionic "r" mode does not copy it).
+    // The bounded leak (~50-200 KB per maps read) is acceptable at startup.
+    FILE *result = fmemopen(content, csz, "r");
     if (!result) free(content);
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// fd version — returned by hooked open / openat
+// ---------------------------------------------------------------------------
+
+static int build_filtered_maps_fd() {
+    if (g_in_maps_build) return -1;
+    g_in_maps_build = true;
+    size_t csz = 0;
+    char *content = build_filtered_content(&csz);
+    g_in_maps_build = false;
+    if (!content) return -1;
+
+    // Prefer memfd_create: seekable, no size limit, no pipe-deadlock risk.
+    // Available on Android 6+ (kernel 3.17+, __NR_memfd_create defined in NDK).
+    int mfd = -1;
+#ifdef __NR_memfd_create
+    mfd = (int)syscall(__NR_memfd_create, "maps", 0);
+#endif
+    if (mfd >= 0) {
+        size_t written = 0;
+        while (written < csz) {
+            ssize_t n = write(mfd, content + written, csz - written);
+            if (n <= 0) break;
+            written += (size_t)n;
+        }
+        free(content);
+        lseek(mfd, 0, SEEK_SET);
+        return mfd;
+    }
+
+    // Fallback for Android 5.x: pipe. Resize the kernel pipe buffer to fit
+    // the content so we can write everything before the caller reads (avoids
+    // a blocking-write deadlock on large maps files).
+    int pfd[2];
+    if (pipe(pfd) != 0) { free(content); return -1; }
+#ifdef F_SETPIPE_SZ
+    fcntl(pfd[1], F_SETPIPE_SZ, (int)(csz + 4096));
+#endif
+    size_t written = 0;
+    while (written < csz) {
+        ssize_t n = write(pfd[1], content + written, csz - written);
+        if (n <= 0) break;
+        written += (size_t)n;
+    }
+    close(pfd[1]);
+    free(content);
+    return pfd[0];
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +305,6 @@ static bool is_maps_path(const char *path) {
     if (!path) return false;
     if (strcmp(path, "/proc/self/maps") == 0) return true;
     if (strncmp(path, "/proc/", 6) != 0) return false;
-    // /proc/<digits>/maps
     const char *p = path + 6;
     while (*p >= '0' && *p <= '9') p++;
     return strcmp(p, "/maps") == 0;
@@ -228,7 +314,6 @@ static bool is_maps_path(const char *path) {
 // Hooked fopen / fopen64
 // ---------------------------------------------------------------------------
 
-static FILE *(*orig_fopen)(const char *, const char *) = nullptr;
 static FILE *hooked_fopen(const char *path, const char *mode) {
     if (is_maps_path(path)) {
         ALOGD("ProcMapsHook: fopen(%s) intercepted", path);
@@ -238,7 +323,6 @@ static FILE *hooked_fopen(const char *path, const char *mode) {
     return orig_fopen(path, mode);
 }
 
-static FILE *(*orig_fopen64)(const char *, const char *) = nullptr;
 static FILE *hooked_fopen64(const char *path, const char *mode) {
     if (is_maps_path(path)) {
         FILE *f = build_filtered_maps();
@@ -248,13 +332,48 @@ static FILE *hooked_fopen64(const char *path, const char *mode) {
 }
 
 // ---------------------------------------------------------------------------
+// Hooked open / openat — covers direct fd-layer readers (TSS, GameGuard…)
+// ---------------------------------------------------------------------------
+
+static int hooked_open(const char *path, int flags, ...) {
+    if (is_maps_path(path)) {
+        ALOGD("ProcMapsHook: open(%s) intercepted", path);
+        int fd = build_filtered_maps_fd();
+        if (fd >= 0) return fd;
+    }
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        mode = va_arg(args, mode_t);
+        va_end(args);
+    }
+    return orig_open(path, flags, mode);
+}
+
+static int hooked_openat(int dirfd, const char *path, int flags, ...) {
+    if (is_maps_path(path)) {
+        ALOGD("ProcMapsHook: openat(%s) intercepted", path);
+        int fd = build_filtered_maps_fd();
+        if (fd >= 0) return fd;
+    }
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        mode = va_arg(args, mode_t);
+        va_end(args);
+    }
+    return orig_openat(dirfd, path, flags, mode);
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 void ProcMapsHook::setHostDataDir(const char *hostDataDir) {
     if (hostDataDir && hostDataDir[0]) {
         snprintf(g_host_data_dir, sizeof(g_host_data_dir), "%s", hostDataDir);
-        // Strip trailing slash if present
         size_t len = strlen(g_host_data_dir);
         if (len > 0 && g_host_data_dir[len - 1] == '/') {
             g_host_data_dir[len - 1] = '\0';
@@ -273,14 +392,28 @@ void ProcMapsHook::init() {
 
     void *fopen_sym   = dlsym(libc, "fopen");
     void *fopen64_sym = dlsym(libc, "fopen64");
+    void *open_sym    = dlsym(libc, "open");
+    void *openat_sym  = dlsym(libc, "openat");
 
     if (fopen_sym) {
         DobbyHook(fopen_sym, (void *)hooked_fopen, (void **)&orig_fopen);
         ALOGD("ProcMapsHook: hooked fopen");
     }
+    // fopen64 is a distinct symbol only on 32-bit bionic; skip on 64-bit where
+    // it aliases fopen (same address), to avoid double-hooking the same function.
     if (fopen64_sym && fopen64_sym != fopen_sym) {
         DobbyHook(fopen64_sym, (void *)hooked_fopen64, (void **)&orig_fopen64);
         ALOGD("ProcMapsHook: hooked fopen64");
+    }
+    // On arm64 bionic, open() is typically just openat(AT_FDCWD,...) — same
+    // function address. Only hook open() separately when it is distinct.
+    if (open_sym && open_sym != openat_sym) {
+        DobbyHook(open_sym, (void *)hooked_open, (void **)&orig_open);
+        ALOGD("ProcMapsHook: hooked open");
+    }
+    if (openat_sym) {
+        DobbyHook(openat_sym, (void *)hooked_openat, (void **)&orig_openat);
+        ALOGD("ProcMapsHook: hooked openat");
     }
 
     dlclose(libc);
