@@ -93,9 +93,12 @@ static void clean_maps_line(const char *line, char *out, size_t out_size) {
                     if (extract_pkg(pkg_start, guest_pkg, sizeof(guest_pkg))) {
                         // Build full target and replacement
                         char target[700], repl[300];
+                        // pkg_start - after_pfx includes the trailing '/' of the uid
+                        // segment (e.g. "0/"). Subtract 1 so %.*s prints just "0",
+                        // then the format's own '/' produces the single separator.
                         snprintf(target, sizeof(target), "%s/data/user/%.*s/%s/",
                                  g_host_data_dir,
-                                 (int)(pkg_start - after_pfx),
+                                 (int)(pkg_start - after_pfx - 1),
                                  after_pfx,
                                  guest_pkg);
                         snprintf(repl, sizeof(repl), "/data/data/%s/", guest_pkg);
@@ -173,7 +176,10 @@ static void clean_maps_line(const char *line, char *out, size_t out_size) {
 // ---------------------------------------------------------------------------
 
 static FILE *build_filtered_maps() {
-    FILE *real = fopen("/proc/self/maps", "r");
+    // MUST use orig_fopen, not fopen — fopen is already hooked at this point
+    // and calling it here would cause infinite recursion → stack overflow.
+    if (!orig_fopen) return nullptr;
+    FILE *real = orig_fopen("/proc/self/maps", "r");
     if (!real) return nullptr;
 
     char *content = nullptr;
