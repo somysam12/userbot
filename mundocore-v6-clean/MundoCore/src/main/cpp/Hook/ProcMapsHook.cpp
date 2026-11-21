@@ -8,7 +8,7 @@
 //   <host_data_dir>/data/user/<uid>/<pkg>/  ->  /data/data/<pkg>/
 //   <host_data_dir>/data/user_de/<uid>/<pkg>/  ->  /data/user_de/<uid>/<pkg>/
 //   <host_data_dir>/data/app/<pkg>/  ->  /data/app/<pkg>/
-//   SdCard/Android/  ->  Android/
+//   <host_data_dir>/SdCard/  ->  /storage/emulated/0/
 //
 
 #include "ProcMapsHook.h"
@@ -156,7 +156,20 @@ static void clean_maps_line(const char *line, char *out, size_t out_size) {
         }
     }
 
-    // ---- SdCard/Android/ -> Android/ ----
+    // ---- <host_data_dir>/SdCard/ -> /storage/emulated/0/ ----
+    // This fully cleans the bbox external storage path so the game sees the
+    // expected real sdcard path instead of the sandbox host prefix.
+    // e.g. /data/data/com.mundo.bbox/files/SdCard/Android/obb/com.pubg.imobile/
+    //   -> /storage/emulated/0/Android/obb/com.pubg.imobile/
+    if (g_host_data_dir[0]) {
+        char sdcard_pfx[600];
+        snprintf(sdcard_pfx, sizeof(sdcard_pfx), "%s/SdCard/", g_host_data_dir);
+        if (strstr(cur, sdcard_pfx)) {
+            char *tmp = str_replace_first(cur, sdcard_pfx, "/storage/emulated/0/");
+            if (tmp) { free(cur); cur = tmp; }
+        }
+    }
+    // Fallback: bare SdCard/Android/ pattern (e.g. paths without the full prefix)
     if (strstr(cur, "SdCard/Android/")) {
         char *tmp = str_replace_first(cur, "SdCard/Android/", "Android/");
         if (tmp) { free(cur); cur = tmp; }
