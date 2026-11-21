@@ -17,11 +17,20 @@ static char            g_path[512] = {};
 static pthread_mutex_t g_mtx   = PTHREAD_MUTEX_INITIALIZER;
 
 void DebugLogger::init(const char *hostDataDir) {
-    if (!hostDataDir || !hostDataDir[0]) return;
     pthread_mutex_lock(&g_mtx);
     if (g_fd >= 0) { close(g_fd); g_fd = -1; }
-    snprintf(g_path, sizeof(g_path), "%s/bbox_trace.log", hostDataDir);
-    g_fd = open(g_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0666);
+
+    // Try external storage first so user can read without PC
+    const char *ext = "/storage/emulated/0/bbox_trace.log";
+    int fd = open(ext, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0666);
+    if (fd >= 0) {
+        snprintf(g_path, sizeof(g_path), "%s", ext);
+        g_fd = fd;
+    } else if (hostDataDir && hostDataDir[0]) {
+        // Fallback to app's internal data dir
+        snprintf(g_path, sizeof(g_path), "%s/bbox_trace.log", hostDataDir);
+        g_fd = open(g_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0666);
+    }
     pthread_mutex_unlock(&g_mtx);
     log("=== BBOX TRACE START === pid=%d log=%s", (int)getpid(), g_path);
 }
