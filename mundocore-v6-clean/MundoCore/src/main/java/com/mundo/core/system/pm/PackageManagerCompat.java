@@ -4,6 +4,7 @@ import android.annotation.SuppressLint;
 import android.content.Context;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
+import android.util.Log;
 import android.content.pm.ConfigurationInfo;
 import android.content.pm.FeatureInfo;
 import android.content.pm.InstrumentationInfo;
@@ -331,6 +332,11 @@ public class PackageManagerCompat {
             }
         }
         fixJar(ai);
+        Log.d("BBOX_TRACE", "[pkg-info] pkg=" + ai.packageName
+                + " dataDir=" + ai.dataDir
+                + " nativeLibDir=" + ai.nativeLibraryDir
+                + " sourceDir=" + ai.sourceDir
+                + " uid=" + ai.uid);
         return ai;
     }
 

@@ -6,8 +6,59 @@
 
 #include <IO.h>
 #include "UnixFileSystemHook.h"
-#include "JniHook/JniHook.h"   // Fixed: was #import (invalid C++), now #include
+#include "JniHook/JniHook.h"
 #include "BaseHook.h"
+#include "DebugLogger.h"
+
+// Log Java-layer file redirects only when path is interesting (OBB/data/so/apk/pkg).
+static inline bool ufs_should_trace(const char *p) {
+    if (!p || !p[0]) return false;
+    return strstr(p, "/data/") || strstr(p, "/storage/") || strstr(p, "/sdcard") ||
+           strstr(p, ".so")   || strstr(p, ".apk")      || strstr(p, ".obb")   ||
+           strstr(p, ".dex")  || strstr(p, ".vdex")     || strstr(p, ".odex");
+}
+
+// Trace a jstring path; logs only when interesting or redirected.
+static void trace_jstr_redirect(JNIEnv *env, const char *method,
+                                 jstring orig, jstring redir) {
+    if (orig == redir) {
+        // No redirect — log only if path is interesting.
+        const char *cs = env->GetStringUTFChars(orig, nullptr);
+        if (cs) {
+            if (ufs_should_trace(cs))
+                TRACE("[jfs] %s  %s", method, cs);
+            env->ReleaseStringUTFChars(orig, cs);
+        }
+        return;
+    }
+    const char *co = env->GetStringUTFChars(orig,  nullptr);
+    const char *cr = env->GetStringUTFChars(redir, nullptr);
+    TRACE("[jfs-redir] %s  %s  =>  %s", method,
+          co ? co : "?", cr ? cr : "?");
+    if (co) env->ReleaseStringUTFChars(orig,  co);
+    if (cr) env->ReleaseStringUTFChars(redir, cr);
+}
+
+// Trace a File-object path redirect via getPath().
+static void trace_file_redirect(JNIEnv *env, const char *method,
+                                 jobject orig, jobject redir) {
+    if (orig == redir) return;
+    jclass clazz = env->FindClass("java/io/File");
+    if (!clazz) return;
+    jmethodID mid = env->GetMethodID(clazz, "getPath", "()Ljava/lang/String;");
+    env->DeleteLocalRef(clazz);
+    if (!mid) return;
+    jstring so = (jstring)env->CallObjectMethod(orig,  mid);
+    jstring sr = (jstring)env->CallObjectMethod(redir, mid);
+    const char *co = so ? env->GetStringUTFChars(so, nullptr) : nullptr;
+    const char *cr = sr ? env->GetStringUTFChars(sr, nullptr) : nullptr;
+    TRACE("[jfs-redir] %s  %s  =>  %s", method,
+          co ? co : "?", cr ? cr : "?");
+    if (co && so) env->ReleaseStringUTFChars(so, co);
+    if (cr && sr) env->ReleaseStringUTFChars(sr, cr);
+    if (so) env->DeleteLocalRef(so);
+    if (sr) env->DeleteLocalRef(sr);
+}
 
 /*
  * Class:     java_io_UnixFileSystem
@@ -16,8 +67,9 @@
  */
 HOOK_JNI(jstring, canonicalize0, JNIEnv *env, jobject obj, jstring path) {
     jstring redirect = IO::redirectPath(env, path);
+    trace_jstr_redirect(env, "canonicalize0", path, redirect);
     jstring result = orig_canonicalize0(env, obj, redirect);
-    if (redirect != path) env->DeleteLocalRef(redirect);   // avoid JNI local-ref table overflow
+    if (redirect != path) env->DeleteLocalRef(redirect);
     return result;
 }
 
@@ -28,6 +80,7 @@ HOOK_JNI(jstring, canonicalize0, JNIEnv *env, jobject obj, jstring path) {
  */
 HOOK_JNI(jint, getBooleanAttributes0, JNIEnv *env, jobject obj, jstring abspath) {
     jstring redirect = IO::redirectPath(env, abspath);
+    trace_jstr_redirect(env, "getBooleanAttributes0", abspath, redirect);
     jint result = orig_getBooleanAttributes0(env, obj, redirect);
     if (redirect != abspath) env->DeleteLocalRef(redirect);
     return result;
@@ -40,6 +93,7 @@ HOOK_JNI(jint, getBooleanAttributes0, JNIEnv *env, jobject obj, jstring abspath)
  */
 HOOK_JNI(jlong, getLastModifiedTime0, JNIEnv *env, jobject obj, jobject path) {
     jobject redirect = IO::redirectPath(env, path);
+    trace_file_redirect(env, "getLastModifiedTime0", path, redirect);
     jlong result = orig_getLastModifiedTime0(env, obj, redirect);
     if (redirect != path) env->DeleteLocalRef(redirect);
     return result;
@@ -53,6 +107,7 @@ HOOK_JNI(jlong, getLastModifiedTime0, JNIEnv *env, jobject obj, jobject path) {
 HOOK_JNI(jboolean, setPermission0, JNIEnv *env, jobject obj, jobject file, jint access,
          jboolean enable, jboolean owneronly) {
     jobject redirect = IO::redirectPath(env, file);
+    trace_file_redirect(env, "setPermission0", file, redirect);
     jboolean result = orig_setPermission0(env, obj, redirect, access, enable, owneronly);
     if (redirect != file) env->DeleteLocalRef(redirect);
     return result;
@@ -65,6 +120,7 @@ HOOK_JNI(jboolean, setPermission0, JNIEnv *env, jobject obj, jobject file, jint 
  */
 HOOK_JNI(jboolean, createFileExclusively0, JNIEnv *env, jobject obj, jstring path) {
     jstring redirect = IO::redirectPath(env, path);
+    trace_jstr_redirect(env, "createFileExclusively0", path, redirect);
     jboolean result = orig_createFileExclusively0(env, obj, redirect);
     if (redirect != path) env->DeleteLocalRef(redirect);
     return result;
@@ -77,6 +133,7 @@ HOOK_JNI(jboolean, createFileExclusively0, JNIEnv *env, jobject obj, jstring pat
  */
 HOOK_JNI(jobjectArray, list0, JNIEnv *env, jobject obj, jobject file) {
     jobject redirect = IO::redirectPath(env, file);
+    trace_file_redirect(env, "list0", file, redirect);
     jobjectArray result = orig_list0(env, obj, redirect);
     if (redirect != file) env->DeleteLocalRef(redirect);
     return result;
@@ -89,6 +146,7 @@ HOOK_JNI(jobjectArray, list0, JNIEnv *env, jobject obj, jobject file) {
  */
 HOOK_JNI(jboolean, createDirectory0, JNIEnv *env, jobject obj, jobject path) {
     jobject redirect = IO::redirectPath(env, path);
+    trace_file_redirect(env, "createDirectory0", path, redirect);
     jboolean result = orig_createDirectory0(env, obj, redirect);
     if (redirect != path) env->DeleteLocalRef(redirect);
     return result;
@@ -101,6 +159,7 @@ HOOK_JNI(jboolean, createDirectory0, JNIEnv *env, jobject obj, jobject path) {
  */
 HOOK_JNI(jboolean, setLastModifiedTime0, JNIEnv *env, jobject obj, jobject file, jobject time) {
     jobject redirect = IO::redirectPath(env, file);
+    trace_file_redirect(env, "setLastModifiedTime0", file, redirect);
     jboolean result = orig_setLastModifiedTime0(env, obj, redirect, time);
     if (redirect != file) env->DeleteLocalRef(redirect);
     return result;
@@ -113,6 +172,7 @@ HOOK_JNI(jboolean, setLastModifiedTime0, JNIEnv *env, jobject obj, jobject file,
  */
 HOOK_JNI(jboolean, setReadOnly0, JNIEnv *env, jobject obj, jobject file) {
     jobject redirect = IO::redirectPath(env, file);
+    trace_file_redirect(env, "setReadOnly0", file, redirect);
     jboolean result = orig_setReadOnly0(env, obj, redirect);
     if (redirect != file) env->DeleteLocalRef(redirect);
     return result;

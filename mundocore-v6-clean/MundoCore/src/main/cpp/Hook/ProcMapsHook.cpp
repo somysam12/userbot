@@ -13,6 +13,7 @@
 
 #include "ProcMapsHook.h"
 #include "Dobby/dobby.h"
+#include "DebugLogger.h"
 #include "../Log.h"
 
 #include <stdio.h>
@@ -175,6 +176,22 @@ static void clean_maps_line(const char *line, char *out, size_t out_size) {
         if (tmp) { free(cur); cur = tmp; }
     }
 
+    // Log if this line was modified (bbox path was cleaned)
+    if (strcmp(line, cur) != 0) {
+        // Extract only the path column (last token after the last space)
+        const char *orig_p = strrchr(line, ' ');
+        const char *new_p  = strrchr(cur,  ' ');
+        if (orig_p && new_p && strcmp(orig_p, new_p) != 0) {
+            char op[256], np[256];
+            snprintf(op, sizeof(op), "%s", orig_p + 1);
+            snprintf(np, sizeof(np), "%s", new_p + 1);
+            // strip trailing newline for readability
+            char *nl;
+            if ((nl = strchr(op, '\n'))) *nl = '\0';
+            if ((nl = strchr(np, '\n'))) *nl = '\0';
+            TRACE("[maps-clean] %s  =>  %s", op, np);
+        }
+    }
     strncpy(out, cur, out_size - 1);
     out[out_size - 1] = '\0';
     free(cur);
@@ -230,9 +247,12 @@ static char *build_filtered_content(size_t *out_sz) {
     if (!content) { fclose(real); return nullptr; }
     size_t csz = 0;
 
+    int total_lines = 0, cleaned_lines = 0;
     char line[2048], filtered[2048];
     while (fgets(line, sizeof(line), real)) {
+        total_lines++;
         clean_maps_line(line, filtered, sizeof(filtered));
+        if (strcmp(line, filtered) != 0) cleaned_lines++;
         size_t flen = strlen(filtered);
         if (csz + flen + 1 > cap) {
             cap = (csz + flen + 1) * 2;
@@ -244,6 +264,7 @@ static char *build_filtered_content(size_t *out_sz) {
         csz += flen;
     }
     fclose(real);
+    TRACE("[maps] /proc/self/maps: %d lines, %d bbox paths cleaned", total_lines, cleaned_lines);
 
     if (csz == 0) { free(content); return nullptr; }
     content[csz] = '\0';
@@ -365,19 +386,33 @@ static bool is_maps_path(const char *path) {
 // Hooked fopen / fopen64
 // ---------------------------------------------------------------------------
 
+static inline bool should_trace_path(const char *p) {
+    if (!p || !p[0]) return false;
+    return strstr(p, "/data/") || strstr(p, "/storage/") ||
+           strstr(p, "/sdcard") || strstr(p, "/proc/") ||
+           strstr(p, ".so")  || strstr(p, ".apk") || strstr(p, ".obb") ||
+           strstr(p, ".dex") || strstr(p, ".vdex") || strstr(p, ".odex") ||
+           strstr(p, "package") || strstr(p, "maps");
+}
+
 static FILE *hooked_fopen(const char *path, const char *mode) {
     if (is_maps_path(path)) {
-        ALOGD("ProcMapsHook: fopen(%s) intercepted", path);
+        TRACE("[fopen] /proc/self/maps → filtering");
         FILE *f = build_filtered_maps();
         if (f) return f;
+    } else if (should_trace_path(path)) {
+        TRACE("[fopen] %s (mode=%s)", path, mode ? mode : "?");
     }
     return orig_fopen(path, mode);
 }
 
 static FILE *hooked_fopen64(const char *path, const char *mode) {
     if (is_maps_path(path)) {
+        TRACE("[fopen64] /proc/self/maps → filtering");
         FILE *f = build_filtered_maps();
         if (f) return f;
+    } else if (should_trace_path(path)) {
+        TRACE("[fopen64] %s (mode=%s)", path, mode ? mode : "?");
     }
     return orig_fopen64(path, mode);
 }
@@ -388,9 +423,11 @@ static FILE *hooked_fopen64(const char *path, const char *mode) {
 
 static int hooked_open(const char *path, int flags, ...) {
     if (is_maps_path(path)) {
-        ALOGD("ProcMapsHook: open(%s) intercepted", path);
+        TRACE("[open] /proc/self/maps → filtering (TSS/native path)");
         int fd = build_filtered_maps_fd();
         if (fd >= 0) return fd;
+    } else if (should_trace_path(path)) {
+        TRACE("[open] %s", path);
     }
     mode_t mode = 0;
     if (flags & O_CREAT) {
@@ -404,9 +441,11 @@ static int hooked_open(const char *path, int flags, ...) {
 
 static int hooked_openat(int dirfd, const char *path, int flags, ...) {
     if (is_maps_path(path)) {
-        ALOGD("ProcMapsHook: openat(%s) intercepted", path);
+        TRACE("[openat] /proc/self/maps → filtering (TSS/native path)");
         int fd = build_filtered_maps_fd();
         if (fd >= 0) return fd;
+    } else if (should_trace_path(path)) {
+        TRACE("[openat] %s", path);
     }
     mode_t mode = 0;
     if (flags & O_CREAT) {
@@ -429,7 +468,9 @@ void ProcMapsHook::setHostDataDir(const char *hostDataDir) {
         if (len > 0 && g_host_data_dir[len - 1] == '/') {
             g_host_data_dir[len - 1] = '\0';
         }
-        ALOGD("ProcMapsHook: hostDataDir = %s", g_host_data_dir);
+        // Init logger here — writes to {hostDataDir}/bbox_trace.log
+        DebugLogger::init(g_host_data_dir);
+        TRACE("[init] ProcMapsHook hostDataDir=%s", g_host_data_dir);
     }
 }
 
