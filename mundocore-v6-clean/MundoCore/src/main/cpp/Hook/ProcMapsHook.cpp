@@ -224,20 +224,29 @@ static char *build_filtered_content(size_t *out_sz) {
     }
     if (!real) return nullptr;
 
-    char *content = nullptr;
+    // Manual growing buffer — avoids open_memstream (requires API 23+)
+    size_t cap = 65536;
+    char *content = (char *)malloc(cap);
+    if (!content) { fclose(real); return nullptr; }
     size_t csz = 0;
-    FILE *ms = open_memstream(&content, &csz);
-    if (!ms) { fclose(real); return nullptr; }
 
     char line[2048], filtered[2048];
     while (fgets(line, sizeof(line), real)) {
         clean_maps_line(line, filtered, sizeof(filtered));
-        fputs(filtered, ms);
+        size_t flen = strlen(filtered);
+        if (csz + flen + 1 > cap) {
+            cap = (csz + flen + 1) * 2;
+            char *tmp = (char *)realloc(content, cap);
+            if (!tmp) { free(content); fclose(real); return nullptr; }
+            content = tmp;
+        }
+        memcpy(content + csz, filtered, flen);
+        csz += flen;
     }
     fclose(real);
-    fclose(ms);
 
-    if (!content || csz == 0) { free(content); return nullptr; }
+    if (csz == 0) { free(content); return nullptr; }
+    content[csz] = '\0';
     *out_sz = csz;
     return content;
 }
@@ -253,12 +262,41 @@ static FILE *build_filtered_maps() {
     char *content = build_filtered_content(&csz);
     g_in_maps_build = false;
     if (!content) return nullptr;
-    // content backs the returned FILE*; freed when FILE is closed only if
-    // fmemopen uses the buffer (Android bionic "r" mode does not copy it).
-    // The bounded leak (~50-200 KB per maps read) is acceptable at startup.
-    FILE *result = fmemopen(content, csz, "r");
-    if (!result) free(content);
-    return result;
+    // Create seekable fd, wrap as FILE* — avoids fmemopen (requires API 23+)
+    int mfd = -1;
+#ifdef __NR_memfd_create
+    mfd = (int)syscall(__NR_memfd_create, "maps", 0);
+#endif
+    if (mfd >= 0) {
+        size_t written = 0;
+        while (written < csz) {
+            ssize_t n = write(mfd, content + written, csz - written);
+            if (n <= 0) break;
+            written += (size_t)n;
+        }
+        free(content);
+        lseek(mfd, 0, SEEK_SET);
+        FILE *f = fdopen(mfd, "r");
+        if (!f) close(mfd);
+        return f;
+    }
+    // Pipe fallback (Android 5.x / no memfd_create)
+    int pfd[2];
+    if (pipe(pfd) != 0) { free(content); return nullptr; }
+#ifdef F_SETPIPE_SZ
+    fcntl(pfd[1], F_SETPIPE_SZ, (int)(csz + 4096));
+#endif
+    size_t pw = 0;
+    while (pw < csz) {
+        ssize_t n = write(pfd[1], content + pw, csz - pw);
+        if (n <= 0) break;
+        pw += (size_t)n;
+    }
+    close(pfd[1]);
+    free(content);
+    FILE *f = fdopen(pfd[0], "r");
+    if (!f) close(pfd[0]);
+    return f;
 }
 
 // ---------------------------------------------------------------------------
