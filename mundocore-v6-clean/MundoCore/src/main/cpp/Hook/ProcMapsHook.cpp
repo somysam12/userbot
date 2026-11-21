@@ -26,6 +26,9 @@
 #include <sys/syscall.h>
 
 static char g_host_data_dir[512] = {};
+// Host package name extracted from g_host_data_dir, e.g. "com.google.ark".
+// Any maps line containing this string is removed so TSS never sees host paths.
+static char g_host_pkg[256] = {};
 
 // Per-thread re-entrance guard. Prevents the hook from triggering itself when
 // build_filtered_content() calls orig_open/orig_fopen internally.
@@ -69,6 +72,23 @@ static bool extract_pkg(const char *start, char *out, size_t out_size) {
 }
 
 static void clean_maps_line(const char *line, char *out, size_t out_size) {
+    // Drop any maps line that exposes the host package name.
+    // This covers lines like:
+    //   /data/app/~~hash==/com.google.ark-hash==/lib/arm64/libMundoCore.so
+    //   /data/user/0/com.google.ark/cache/...
+    // TSS uses these to detect virtual container environments.
+    if (g_host_pkg[0] && strstr(line, g_host_pkg)) {
+        const char *orig_p = strrchr(line, ' ');
+        if (orig_p) {
+            char op[256];
+            snprintf(op, sizeof(op), "%s", orig_p + 1);
+            char *nl = strchr(op, '\n'); if (nl) *nl = '\0';
+            TRACE("[maps-drop] hiding host path: %s", op);
+        }
+        out[0] = '\0';   // empty → caller skips this line
+        return;
+    }
+
     char *cur = strdup(line);
     if (!cur) {
         strncpy(out, line, out_size - 1);
@@ -252,6 +272,7 @@ static char *build_filtered_content(size_t *out_sz) {
     while (fgets(line, sizeof(line), real)) {
         total_lines++;
         clean_maps_line(line, filtered, sizeof(filtered));
+        if (filtered[0] == '\0') { cleaned_lines++; continue; }  // line dropped
         if (strcmp(line, filtered) != 0) cleaned_lines++;
         size_t flen = strlen(filtered);
         if (csz + flen + 1 > cap) {
@@ -468,9 +489,34 @@ void ProcMapsHook::setHostDataDir(const char *hostDataDir) {
         if (len > 0 && g_host_data_dir[len - 1] == '/') {
             g_host_data_dir[len - 1] = '\0';
         }
-        // Init logger here — writes to {hostDataDir}/bbox_trace.log
+
+        // Extract host package name from path, e.g.:
+        //   /data/user/0/com.google.ark/files  →  "com.google.ark"
+        //   /data/data/com.google.ark/files    →  "com.google.ark"
+        g_host_pkg[0] = '\0';
+        const char *pkg_start = nullptr;
+        const char *p1 = strstr(g_host_data_dir, "/data/user/");
+        const char *p2 = strstr(g_host_data_dir, "/data/data/");
+        if (p1) {
+            // skip /data/user/0/
+            const char *uid_sep = strchr(p1 + strlen("/data/user/"), '/');
+            if (uid_sep) pkg_start = uid_sep + 1;
+        } else if (p2) {
+            pkg_start = p2 + strlen("/data/data/");
+        }
+        if (pkg_start && *pkg_start) {
+            const char *pkg_end = strchr(pkg_start, '/');
+            if (!pkg_end) pkg_end = pkg_start + strlen(pkg_start);
+            size_t plen = (size_t)(pkg_end - pkg_start);
+            if (plen > 0 && plen < sizeof(g_host_pkg)) {
+                memcpy(g_host_pkg, pkg_start, plen);
+                g_host_pkg[plen] = '\0';
+            }
+        }
+
+        // Init logger here — writes to external storage or {hostDataDir}/bbox_trace.log
         DebugLogger::init(g_host_data_dir);
-        TRACE("[init] ProcMapsHook hostDataDir=%s", g_host_data_dir);
+        TRACE("[init] ProcMapsHook hostDataDir=%s hostPkg=%s", g_host_data_dir, g_host_pkg);
     }
 }
 
